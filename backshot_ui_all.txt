@@ -1625,6 +1625,18 @@ function Library:AddWindow(hubTitle, hubImage, gameTitle)
 	}, NeverloseCS2)
 	local MainFrameUIScale
 	local windowTargetSize = MainFrame.Size
+	do
+		-- Backshot: a wider default so control labels and dropdowns are not
+		-- clipped (the library's own 0.78 x 0.78 scale default reads as a near-
+		-- square box on most phone aspect ratios). Clamped to the actual screen.
+		local camera = workspace.CurrentCamera
+		local viewport = camera and camera.ViewportSize
+		local defaultWidth = math.clamp(viewport and viewport.X * 0.92 or 760, 360, 820)
+		local defaultHeight = math.clamp(viewport and viewport.Y * 0.8 or 560, 300, 620)
+		local fixedSize = UDim2.fromOffset(defaultWidth, defaultHeight)
+		windowTargetSize = fixedSize
+		MainFrame.Size = fixedSize
+	end
 	local windowAnimSize = UDim2.new(
 		windowTargetSize.X.Scale * 0.97, windowTargetSize.X.Offset * 0.97,
 		windowTargetSize.Y.Scale * 0.97, windowTargetSize.Y.Offset * 0.97
@@ -13361,33 +13373,10 @@ New("Frame", {
 
 
 	--
-	-- Close button (top-right corner of MainFrame) and manual resize (bottom-right
-	-- corner drag), added for Backshot. Both reuse the window's own toggle/size
-	-- state so they stay consistent with the keybind and the floating icon.
-	local CloseButton = New("TextButton", {
-		Name = "BackshotClose",
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -8, 0, 8),
-		Size = UDim2.fromOffset(24, 24),
-		BackgroundColor3 = Color3.fromRGB(60, 20, 20),
-		BackgroundTransparency = 0.1,
-		Text = "X",
-		TextColor3 = Color3.fromRGB(255, 255, 255),
-		Font = Enum.Font.GothamBold,
-		TextSize = 14,
-		ZIndex = 50,
-		BorderSizePixel = 0,
-	}, MainFrame)
-	do
-		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(0, 6)
-		corner.Parent = CloseButton
-	end
-	CloseButton.MouseButton1Click:Connect(function()
-		if AcrylicBlur and AcrylicBlur.toggleGui then AcrylicBlur.toggleGui() end
-	end)
-
-	local ResizeHandle = New("Frame", {
+	-- Manual resize (bottom-right corner drag), added for Backshot.
+	-- Reuses the window's own size state so it stays consistent after
+	-- closing and reopening.
+		local ResizeHandle = New("Frame", {
 		Name = "BackshotResize",
 		AnchorPoint = Vector2.new(1, 1),
 		Position = UDim2.new(1, -2, 1, -2),
@@ -14683,33 +14672,16 @@ Backshot.Boxes = BoxController
 --
 -- Ghost mode (backshot_ghost.lua)
 local Ghost = (function()
--- backshot_ghost.lua
--- Hide-and-return mode written from scratch on public Roblox APIs.
---
--- Start():  saves your position, moves the real character to a hidden spot and
---           holds it there, leaves a static local decoy where you stood, and
---           points the camera at the decoy.
--- Stop():   puts the real character back at the saved position, removes the
---           decoy and gives the camera back.
---
--- Usage:
---   local Ghost = loadstring(readfile("backshot/backshot_ghost.lua"))()
---   local ghost = Ghost.new({
---       Players = game:GetService("Players"),
---       RunService = game:GetService("RunService"),
---       Workspace = game:GetService("Workspace"),
---   })
---   ghost.Start()
---   ghost.Stop()
---   ghost.Unload()
---
--- Limits (not verified in-game):
---   * The decoy is static. Movement input moves the hidden real character, not the decoy.
---   * Whether the server accepts the hidden position, and whether the game reacts
---     to it, depends on the game and is unknown here.
---   * Config.HidePosition is an untuned default; change it if it does not work.
-
 local Ghost = {}
+
+-- Pure helper: clamps each axis of `position` to within `radius` studs of `center`.
+-- Kept free of Roblox objects so it can be checked on its own.
+local function clampToBox(position, center, radius)
+    local dx = math.clamp(position.X - center.X, -radius, radius)
+    local dy = math.clamp(position.Y - center.Y, -radius, radius)
+    local dz = math.clamp(position.Z - center.Z, -radius, radius)
+    return Vector3.new(center.X + dx, center.Y + dy, center.Z + dz)
+end
 
 function Ghost.new(env)
     local Players = env.Players
@@ -14728,6 +14700,8 @@ function Ghost.new(env)
 
     self.Config = {
         HidePosition = Vector3.new(0, 10000, 0),
+        -- How far you can run from HidePosition before being pulled back inside the box.
+        SafeRadius = 150,
     }
 
     local function track(connection)
@@ -14786,6 +14760,11 @@ function Ghost.new(env)
         decoy = clone
         camera.CameraSubject = cloneHumanoid
 
+        -- One-time move into the hidden area. After this, the character is free to
+        -- run and strafe there; we only step in if it drifts out of the safe box.
+        realRoot.CFrame = CFrame.new(self.Config.HidePosition)
+        realRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+
         active = true
         track(RunService.Heartbeat:Connect(function()
             if not active then return end
@@ -14793,8 +14772,12 @@ function Ghost.new(env)
                 self.Stop()
                 return
             end
-            realRoot.CFrame = CFrame.new(self.Config.HidePosition)
-            realRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+
+            local position = realRoot.Position
+            local clamped = clampToBox(position, self.Config.HidePosition, self.Config.SafeRadius)
+            if (clamped - position).Magnitude > 0.5 then
+                realRoot.CFrame = CFrame.new(clamped) * (realRoot.CFrame - realRoot.CFrame.Position)
+            end
         end))
         return true
     end
@@ -14830,6 +14813,16 @@ function Ghost.new(env)
         end
     end
 
+    -- Plain on/off, same shape as every other feature's SetEnabled/EnableX.
+    function self.SetGhost(state)
+        if state then
+            return self.Start()
+        else
+            self.Stop()
+            return true
+        end
+    end
+
     function self.IsActive()
         return active
     end
@@ -14845,11 +14838,13 @@ function Ghost.new(env)
         table.clear(connections)
     end
 
+    -- Exposed for isolated checks.
+    self._internal = { clampToBox = clampToBox }
+
     return self
 end
 
 return Ghost
-
 end)()
 local GhostController = Ghost.new({
     Players = game:GetService("Players"),
@@ -16829,38 +16824,6 @@ local function UnloadAll()
     DestroyUi()
 end
 
--- Top-right close button: always on screen, closes the menu and unloads everything.
-local function BuildCloseButton()
-    local parent = GuiParent()
-    if not parent then return end
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "BackshotClose"
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.DisplayOrder = 20002
-    gui.Parent = parent
-
-    local button = Instance.new("TextButton")
-    button.AnchorPoint = Vector2.new(1, 0)
-    button.Position = UDim2.new(1, -10, 0, 10)
-    button.Size = UDim2.fromOffset(34, 34)
-    button.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
-    button.TextColor3 = Color3.new(1, 1, 1)
-    button.Text = "X"
-    button.Font = Enum.Font.GothamBold
-    button.TextSize = 16
-    button.BorderSizePixel = 0
-    button.Parent = gui
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(1, 0)
-    corner.Parent = button
-
-    button.Activated:Connect(function()
-        UnloadAll()
-        if gui.Parent then gui:Destroy() end
-    end)
-end
-
 BuilderController.OnMessage = Notify
 SilentAimController.OnMessage = Notify
 
@@ -16868,7 +16831,6 @@ SilentAimController.OnMessage = Notify
 -- Menu
 UI.ShowLoader = false
 local Window = UI:AddWindow("Backshot", "", "Murder Mystery 2")
-BuildCloseButton()
 
 local TOUCH_ONLY = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
@@ -16911,11 +16873,7 @@ end)
 
 local SecGhost = MoveTab:AddSection("Ghost", "left")
 SecGhost:AddToggle("Ghost (hide)", false, function(State)
-    if State then
-        if not GhostController.Start() then Notify("Ghost: character not ready") end
-    else
-        GhostController.Stop()
-    end
+    if not GhostController.SetGhost(State) and State then Notify("Ghost: character not ready") end
 end)
 
 -- Aimbot tab
